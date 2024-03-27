@@ -1,0 +1,405 @@
+---
+title: "Covid-19 Data Report"
+author: "Deniz D."
+date: "2024-03-27"
+output: pdf_document
+---
+## Introduction
+In this report we aim to analyze the Covid-19 Data Set provided by Johns Hopkins University. This is part of the final project of the Data Science as a Field course. 
+
+We will load global and US data sets and also include the vaccination information. We will use the global set as the training data for our model and use the US data set as the testing data. Basically we will look at the relationship between number of deaths, cases and vaccination.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data Source
+
+More information about JHU Covid-19 data us available at https://coronavirus.jhu.edu/about/how-to-use-our-data
+
+Both US and global covid-19 case and death information files can be found under:
+https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/
+
+The file names are: 
+
+* time_series_covid19_confirmed_global.csv
+
+* time_series_covid19_deaths_global.csv
+
+* time_series_covid19_confirmed_US.csv
+
+* time_series_covid19_deaths_US.csv
+
+Population data can be fount at: https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv
+
+Vaccination data for US is available at: https://raw.githubusercontent.com/govex/COVID-19/master/data_tables/vaccine_data/us_data/time_series/time_series_covid19_vaccine_us.csv
+
+Global vaccination data can be found at:
+https://raw.githubusercontent.com/govex/COVID-19/master/data_tables/vaccine_data/global_data/time_series_covid19_vaccine_global.csv
+
+## Loading the Data
+First, we load the necessary libraries. 
+```{r library, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(dplyr)
+library(caret)
+```
+
+Here, we specify the url and file names for the global and US data sets. 
+```{r urls, message=FALSE, warnings=FALSE}
+# common path to all files
+url_in <- 
+      "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+
+file_names <- 
+  c("time_series_covid19_confirmed_global.csv",
+  "time_series_covid19_deaths_global.csv",
+  "time_series_covid19_confirmed_US.csv",
+  "time_series_covid19_deaths_US.csv")
+
+urls <- str_c(url_in, file_names)
+```
+
+Read in the data sets
+```{r import_data, message=FALSE, warnings=FALSE}
+global_cases <- read_csv(urls[1])
+global_deaths <- read_csv(urls[2])
+US_cases <- read_csv(urls[3])
+US_deaths <- read_csv(urls[4])
+```
+
+
+### Tidying and Transforming the Global Data Set
+We will use the global data set as our training set. 
+
+First we pivot the global cases data set longer and remove the Lat, Long variables that we are not going to use. 
+```{r tidy_global_data}
+global_cases <- global_cases %>%
+  pivot_longer(cols =
+                 -c('Province/State',
+                    'Country/Region', Lat, Long),
+               names_to = "date",
+               values_to = "cases") %>% select (-c(Lat, Long))
+```
+
+We will do the same thing with the global deaths data.
+```{r tidy_global_deaths}
+global_deaths <- global_deaths %>%
+  pivot_longer(cols =
+                 -c('Province/State',
+                    'Country/Region', Lat, Long),
+               names_to = "date",
+               values_to = "deaths") %>% select(-c(Lat, Long))
+```
+
+Now we will join the global cases and deaths data sets. We convert the date to date type and we also filter out 0 cases. 
+```{r join_global_data, warning=FALSE, message=FALSE}
+global <- global_cases %>%
+  full_join(global_deaths) %>%
+  rename(Country_Region = 'Country/Region',
+         Province_State = 'Province/State') %>%
+  mutate(date = mdy(date)) %>%
+      filter(cases > 0)
+```
+
+Let's check the global data set after our clean up.
+```{r global_summary}
+summary(global)
+```
+
+### Adding Population 
+Since there is no population information in the global data set we read in the population information.
+```{r population}
+uid_lookup_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv"
+
+uid <- read.csv(uid_lookup_url) %>%
+    select(-c(Lat, Long_, Combined_Key, code3, iso2, iso3, Admin2))
+```
+
+We join the population data with the global data set. 
+```{r globalpop}
+global$Province_State[is.na(global$Province_State)] <- ""
+global <- global %>%
+      left_join(uid, by = c("Province_State", "Country_Region")) %>%
+      select(-c(UID, FIPS)) %>%
+      select(Province_State, Country_Region, date,
+             cases, deaths, Population)
+```
+
+We sum the cases, deaths per country, per date and introduce the deaths_per_mill variable. 
+```{r global_country, warning = FALSE, message=FALSE}
+global_country <- global %>%
+      group_by(Country_Region, date) %>%
+      summarize(cases = sum(cases), deaths = sum(deaths),
+                Population = sum(Population)) %>%
+      mutate(deaths_per_mill = deaths * 1000000 / Population) %>%
+      select(Country_Region, date,
+             cases, deaths, deaths_per_mill, Population) %>%
+      ungroup()
+```
+
+### Adding Vaccination Information
+From here onwards our analysis starts to differ from the lectures of Data Science as a Field Course. 
+
+Since vaccination information will be part of our model, we read in the vaccination data set. 
+```{r vaccine}
+vaccine_url <- "https://raw.githubusercontent.com/govex/COVID-19/master/data_tables/vaccine_data/global_data/time_series_covid19_vaccine_global.csv"
+vaccine <- read.csv(vaccine_url, header=TRUE) %>%
+      mutate(date = ymd(Date)) %>%
+      select(-c(Date, Province_State, UID))
+```
+
+We join the vaccination data with the global country data set.
+```{r vjoin}
+global_country <-  global_country %>%
+      left_join(vaccine, by = c("Country_Region", "date")) 
+global_country$Doses_admin[is.na(global_country$Doses_admin)] = 0
+```
+
+We create new variables for new cases, new deaths and new doses administered by substracting the lags. There are some invalid entries in the data set, basically although cases are added up as time goes by, there is rarely a smaller number reported the next date. This will be handled by assigning 0 instead of a negative value for new cases etc. Also for the very first value for each country the lag would be NA, in that case again lag is not substracted.
+
+```{r newcase}
+global_country <- global_country %>%
+      group_by(Country_Region) %>%
+      mutate(new_cases = case_when(cases < lag(cases)  ~ 0, 
+                                   is.na(lag(cases)) ~ cases,
+                                   cases >= lag(cases) ~ cases - lag(cases)),
+             new_deaths = case_when(deaths < lag(deaths) ~ 0,
+                                    is.na(lag(deaths)) ~ deaths,
+                                    deaths >= lag(deaths) ~ deaths - lag(deaths)),
+             new_doses_admin = case_when(Doses_admin < lag(Doses_admin) ~ 0,
+                                         is.na(lag(Doses_admin)) ~ Doses_admin,
+                                         Doses_admin >= lag(Doses_admin) ~ 
+                                               Doses_admin - lag(Doses_admin))) %>%
+      ungroup()
+```
+
+Let's check our global data set by country, global_country:
+```{r global_country_summary}
+summary(global_country)
+```
+
+## Tidying and Transforming the US Data Set
+We will use the US data set as our testing data.
+
+We start by pivoting US_cases data set longer and removing variables that we are not going to use. We transform the date to date type.
+```{r tidy_US_cases}
+US_cases <- US_cases %>%
+  pivot_longer(cols = -(UID:Combined_Key),
+               names_to = "date",
+               values_to = "cases")  %>%
+  select(Admin2:cases) %>%
+  mutate(date = mdy(date)) %>%
+  select (-c(Lat, Long_))
+```
+
+We will do the same for the US_deaths dat set, 
+```{r tidy_US_deaths}
+US_deaths <- US_deaths %>%
+  pivot_longer(cols = -(UID:Population),
+               names_to = "date",
+               values_to = "deaths")  %>%
+  select(Admin2:deaths) %>%
+  mutate(date = mdy(date)) %>%
+  select (-c(Lat, Long_))
+```
+
+Now we will join the US_cases and US_deaths sets.
+```{r join_US_data, warning=FALSE, message=FALSE}
+US <- US_cases %>%
+  full_join(US_deaths)
+```
+Let's check US data set after our clean up.
+```{r US_summary}
+summary(US)
+```
+We will group the US data set by states and add sum of cases and deaths and also new cases and new deaths. Just as in the global case, invalid entries and first cases are handled by assigning 0.
+```{r US_by_state, warning=FALSE, message=FALSE}
+US_by_state <- US %>% 
+      group_by(Province_State, Country_Region, date) %>%
+      summarize(cases = sum(cases), deaths = sum(deaths), 
+                Population = sum(Population)) %>%
+      select(Province_State, Country_Region, date, 
+             cases, deaths, Population) %>% 
+      ungroup()
+
+US_by_state <- US_by_state %>% 
+      mutate(new_cases = case_when(cases < lag(cases)  ~ 0, 
+                                   is.na(lag(cases)) ~ cases,
+                                   cases >= lag(cases) ~ cases - lag(cases)),
+             new_deaths = case_when(deaths < lag(deaths) ~ 0,
+                                    is.na(lag(deaths)) ~ deaths,
+                                    deaths >= lag(deaths) ~ deaths - lag(deaths)))
+
+```
+
+### Adding Vaccination Information
+Here we get the vaccination information for US
+```{r us_vac}
+vac_url <- "https://raw.githubusercontent.com/govex/COVID-19/master/data_tables/vaccine_data/us_data/time_series/time_series_covid19_vaccine_us.csv"
+vaccine_US <- read.csv(vac_url, header=TRUE) %>%
+      mutate(date = ymd(Date)) %>%
+      select(-c(Date, UID, Country_Region)) 
+```
+
+We join the US vaccination data with the US_by_state data. 
+```{r usvjoin}
+US_by_state <-  US_by_state %>%
+      left_join(vaccine_US, by = c("Province_State", "date")) 
+
+```
+
+We add the variable new_doses_admin for new doses administered each day. 
+```{r newd}
+US_by_state$Doses_admin[is.na(US_by_state$Doses_admin)] = 0
+
+US_by_state <- US_by_state %>%
+      mutate(new_doses_admin = case_when(Doses_admin < lag(Doses_admin) ~ 0,
+                                         is.na(lag(Doses_admin)) ~ Doses_admin,
+                                         Doses_admin >= lag(Doses_admin) ~ 
+                                               Doses_admin - lag(Doses_admin))) %>%
+      filter(cases > 0)
+
+```
+
+### Exploring the Data 
+
+We take a look at our data by selecting a country (Turkey) and plotting cases, deaths and vaccine doses administered per date.
+```{r country, warning = FALSE}
+country <- "Turkey"
+global_country %>%
+      filter(Country_Region == country) %>%
+      ggplot(aes(x = date, y = cases)) + 
+      geom_line(aes(y = cases, color = "cases")) +
+      geom_point(aes(y = cases, color = "cases")) + 
+      geom_line(aes(y = deaths, color = "deaths")) +
+      geom_point(aes(y=deaths, color="deaths")) +
+      geom_point(aes(y= Doses_admin, color = "Doses_admin")) +
+      scale_y_log10() +
+      theme(legend.position = "bottom", 
+            axis.text.x = element_text(angle = 45)) +
+      labs(title="COVID 19 in Turkey", y = NULL)
+```
+
+To get a more detailed picture, we will take a look at new cases, new deaths and new doses administered. We can see surprising parallels.
+```{r new_turkey, warning=FALSE}
+country <- "Turkey"
+global_country %>%
+      filter(Country_Region == country) %>%
+      ggplot(aes(x = date, y = new_cases)) + 
+      geom_point(aes(color = "new_cases")) + 
+      geom_point(aes(y= new_deaths, color="new_deaths")) +
+      geom_point(aes(y = new_doses_admin, color = "new_doses_admin")) +
+      scale_y_log10() +
+      theme(legend.position = "bottom", 
+            axis.text.x = element_text(angle = 45)) +
+      labs(title="COVID 19 in Turkey - new", y = NULL)
+```
+
+
+
+Let's check for another country (Germany) if we see a similar picture. There seems a strong relationship between number of new deaths, new cases and new vaccinations. 
+
+```{r germany, warning=FALSE}
+country <- "Germany"
+global_country %>%
+      filter(Country_Region == country) %>%
+      ggplot(aes(x = date, y = new_cases)) + 
+      geom_point(aes(color = "new_cases")) + 
+      geom_point(aes(y=new_deaths, color="new_deaths")) +
+      geom_point(aes(y=new_doses_admin, color= "new_doses_admin")) +
+      scale_y_log10() +
+      theme(legend.position = "bottom", 
+            axis.text.x = element_text(angle = 90)) +
+      labs(title="COVID 19 in Germany", y = NULL)
+```
+
+
+
+
+## Modeling the Data
+
+We will fit a generalized linear model. We will use the global by country data (global_country) as our training set. We will try to see the relationship between new deaths, new cases and new doses administered. 
+
+```{r model}
+cofit <- glm(new_deaths ~ new_cases + new_doses_admin, data = global_country, na.action = na.omit)
+
+summary(cofit)      
+```
+
+### Testing the Model
+
+We will use the US_by_state as our testing data set. 
+
+Let's see how our model performs for Colorado. The predicted new deaths are in color purple.
+
+```{r pred_Colorado, warning=FALSE, message=FALSE}
+state <- "Colorado"
+fstate <- US_by_state %>% 
+      filter(Province_State == state) 
+
+predicted = predict(cofit, fstate)
+
+fstate %>%
+      ggplot(aes(x = date, y = new_cases)) + 
+      geom_point(aes(color = "new_cases")) + 
+      geom_point(aes(y = predicted, color="predicted")) +
+      geom_point(aes(y=new_deaths, color="new_deaths")) +
+      geom_point(aes(y=new_doses_admin, color= "new_doses_admin")) +
+      scale_y_log10() +
+      theme(legend.position = "bottom", 
+            axis.text.x = element_text(angle = 90)) +
+      labs(title="COVID 19 in Colorado", y = NULL)
+
+```
+
+Next we will try our model on California data. Here our model performed better. 
+```{r pred_California, warning=FALSE, message=FALSE}
+state <- "California"
+fstate <- US_by_state %>% 
+      filter(Province_State == state) %>%
+      filter(cases > 0)
+
+predicted = predict(cofit, fstate)
+
+fstate %>%
+      ggplot(aes(x = date, y = new_cases)) + 
+      geom_point(aes(color = "new_cases")) + 
+      geom_point(aes(y = predicted, color="predicted")) +
+      geom_point(aes(y=new_deaths, color="new_deaths")) +
+      geom_point(aes(y=new_doses_admin, color= "new_doses_admin")) +
+      scale_y_log10() +
+      theme(legend.position = "bottom", 
+            axis.text.x = element_text(angle = 90)) +
+      labs(title="COVID 19 in California", y = NULL)
+
+```
+`
+Now we will apply our model to the entire US_by_state data set. Our model performance metrics are not that impressive. 
+```{r prediction}
+predict_US <- predict(cofit, US_by_state)
+# model performance metrics 
+data.frame(R2 = R2(predict_US, US_by_state$new_deaths), 
+		RMSE = RMSE(predict_US, US_by_state$new_deaths), 
+		MAE = MAE(predict_US, US_by_state$new_deaths))
+
+```
+
+## Conclusion
+The data we focused on mostly, namely new cases, new deaths and new vaccine doses administered follow an interesting pattern and have many ups and downs. Maybe some of these can be explained by new variants of covid, as those spread people might have gone for vaccination. 
+
+While our model showed some initial hope and reasonably good match in some cases it fell short overall to provide overarching explanation of the patterns. 
+
+There are probably much better ways to model infectious diseases other then linear models. As future improvement suggestion different models can be explored. 
+
+## Potential Sources of Bias
+There is potential bias in the reporting phase of all data. Sometimes even political motivations cause states or countries under report cases or deaths. Also deaths can be under reported by not testing for covid-19. 
+
+I also have personal biases regarding covid-19. There is so much misinformation and conspiracy theories surrounding covid-19 that is a personal pet-peeve of mine. My personal biases probably affected even which variables I chose to work with. 
+
+## Appendix
+```{r session}
+sessionInfo()
+```
